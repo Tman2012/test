@@ -5,67 +5,76 @@
     this runs INSIDE the VM being tested.
 
 .DESCRIPTION
-    Meant to be run once per simulated user: log in once for real, run this instance, then
-    (if you only have one test account) run 1-2 more instances of this same script
-    concurrently in that same logon to simulate the other users on a 3-users-per-VM host -
-    each instance is independent and writes its own uniquely-named report, so multiple
-    instances on the same machine/user never collide or overwrite each other.
+    Meant to be triggered automatically at logon (see the scheduled-task registration added
+    to fslogix_config.ps1/fslogix_cc_config.ps1), since a single real test account can only
+    produce one real logon - so this script simulates the other users on a 3-users-per-VM
+    host itself, by fanning out -Sessions concurrent background jobs within that one logon,
+    rather than requiring -Sessions separate real logons.
 
-    Each instance:
+    Per run:
       1. Detects when the CURRENT session actually started, best-effort, via explorer.exe's
          process start time for this session ID (explorer starts once the desktop loads,
-         right after profile/FSLogix mount completes - a reasonable proxy for "login done").
+         right after profile/FSLogix mount completes - a reasonable proxy for "login done",
+         and normally near-simultaneous with this script's own start if launched by the
+         at-logon scheduled task).
       2. Pulls any Microsoft-FSLogix-Apps/Operational event log entries since that time, as
          supporting diagnostic data (not asserting specific event ID meanings - just surfaced
          raw for you to read).
-      3. Runs the workload for -DurationMinutes: CPU burn, disk I/O, Word/Excel COM
-         automation (Microsoft 365 Apps for enterprise), a Teams process launch/stop, and a
-         headless Chrome launch representing the Genesys Cloud agent desktop's browser +
-         background-assistant footprint. Genesys Cloud itself is NOT logged into - see the
-         Chrome step's own comment for why.
+      3. Runs -Sessions parallel workload streams for -DurationMinutes each: CPU burn, disk
+         I/O, Word/Excel COM automation (Microsoft 365 Apps for enterprise), a Teams process
+         launch/stop, and a headless Chrome launch representing the Genesys Cloud agent
+         desktop's browser + background-assistant footprint. Genesys Cloud itself is NOT
+         logged into - see the Chrome step's own comment for why.
       4. Samples local CPU for the whole window via Get-Counter and evaluates it against
          -CpuThresholdPercent.
-      5. Writes an HTML report, then - ONLY if -LogoffAtEnd is passed - logs off.
+      5. Writes an HTML report (uniquely named per run, so a scheduled task firing on every
+         logon never overwrites a previous run's report), then - ONLY if -LogoffAtEnd is
+         passed - logs off.
 
     -LogoffAtEnd is OFF by default and must be requested explicitly. Logging off ends the
-    ENTIRE Windows session for this user, including every other window and script instance
-    running in it. Only pass it on an instance that owns its own dedicated real logon - never
-    on an instance sharing a session with your own interactive use or other instances.
+    ENTIRE Windows session for this user. Only pass it when this run owns its own dedicated
+    real logon and nothing else needs that session to stay open.
 
 .PARAMETER DurationMinutes
     How long the workload runs. Defaults to 15.
+
+.PARAMETER Sessions
+    Number of concurrent simulated sessions to fan out within this one logon. Defaults to 3
+    (matches production's 3-users-per-VM ratio).
 
 .PARAMETER CpuThresholdPercent
     Average CPU above this over the test window fails the test. Defaults to 85.
 
 .PARAMETER ReportPath
     Where to write the HTML report. Defaults to a file under a 'reports' subfolder next to
-    this script, uniquely named per computer/user/process/timestamp so concurrent instances
-    never overwrite each other.
+    this script, uniquely named per computer/user/process/timestamp so repeated runs (e.g.
+    firing on every logon) never overwrite each other.
 
 .PARAMETER LogoffAtEnd
     If set, logs off this session after the report is written. OFF by default - see
-    .DESCRIPTION for why this is dangerous to set on a shared session.
+    .DESCRIPTION for why this is dangerous to set casually.
 
 .EXAMPLE
-    # Real logon, own dedicated session, OK to log off at the end
-    ./Start-StressTest.ps1 -DurationMinutes 20 -LogoffAtEnd
+    # Typical: fires automatically at logon via the registered scheduled task
+    ./Start-StressTest.ps1 -DurationMinutes 15 -Sessions 3
 
 .EXAMPLE
-    # Simulating a 2nd/3rd "user" in a session you're also using interactively - do NOT
-    # pass -LogoffAtEnd here, it would end your own session too.
-    ./Start-StressTest.ps1 -DurationMinutes 20
+    # Real logon, own dedicated session, OK to log off once the test completes
+    ./Start-StressTest.ps1 -DurationMinutes 20 -Sessions 3 -LogoffAtEnd
 
 .NOTES
-    No Az PowerShell module required. Run each instance as the same user context real
-    sessions run as (not an elevated admin RDP session) if you want the Office/Teams/Chrome
-    results to be representative.
+    No Az PowerShell module required. Run as the same user context real sessions run as (not
+    an elevated admin RDP session) if you want the Office/Teams/Chrome results to be
+    representative.
 #>
 
 [CmdletBinding()]
 param(
     [ValidateRange(1, 240)]
     [int]$DurationMinutes = 15,
+
+    [ValidateRange(1, 10)]
+    [int]$Sessions = 3,
 
     [ValidateRange(1, 100)]
     [int]$CpuThresholdPercent = 85,
@@ -126,14 +135,14 @@ function Get-FSLogixEventsSince {
 }
 
 # ------------------------------------------------------------
-# Workload for the current instance - CPU burn + disk I/O + Word/Excel/
-# Teams/Chrome, run inline (no Start-Job needed - CPU sampling below covers
-# concurrency across instances/processes instead).
+# Workload for one simulated session - CPU burn + disk I/O + Word/Excel/
+# Teams/Chrome. Run as a scriptblock via Start-Job, one job per -Sessions,
+# so all simulated sessions run concurrently within this one logon.
 # ------------------------------------------------------------
-function Invoke-Workload {
-    param([datetime]$Deadline)
+$workload = {
+    param($Deadline, $SessionId)
 
-    $tempDir = Join-Path $env:TEMP "stress-pid$PID"
+    $tempDir = Join-Path $env:TEMP "stress-session$SessionId"
     New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
 
     $chromePath = @(
@@ -170,7 +179,7 @@ function Invoke-Workload {
             $word = New-Object -ComObject Word.Application
             $word.Visible = $false
             $doc = $word.Documents.Add()
-            $doc.Content.Text = ("Stress test pid $PID iteration $($counts.Iterations). " * 50)
+            $doc.Content.Text = ("Stress test session $SessionId iteration $($counts.Iterations). " * 50)
             $docPath = Join-Path $tempDir "doc_$($counts.Iterations).docx"
             $doc.SaveAs([ref]$docPath)
             $doc.Close()
@@ -187,7 +196,7 @@ function Invoke-Workload {
             $excel = New-Object -ComObject Excel.Application
             $excel.Visible = $false
             $wb = $excel.Workbooks.Add()
-            $wb.Sheets.Item(1).Cells.Item(1, 1) = "Stress test pid $PID iteration $($counts.Iterations)"
+            $wb.Sheets.Item(1).Cells.Item(1, 1) = "Stress test session $SessionId iteration $($counts.Iterations)"
             $xlsxPath = Join-Path $tempDir "wb_$($counts.Iterations).xlsx"
             $wb.SaveAs($xlsxPath)
             $wb.Close($false)
@@ -225,7 +234,8 @@ function Invoke-Workload {
     }
 
     Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-    return [PSCustomObject]@{
+    [PSCustomObject]@{
+        SessionId  = $SessionId
         Iterations = $counts.Iterations
         WordFail   = $counts.WordFail
         ExcelFail  = $counts.ExcelFail
@@ -261,7 +271,7 @@ function New-HtmlReport {
         [double]$AvgCpu,
         [double]$MaxCpu,
         [Nullable[bool]]$Pass,
-        [PSCustomObject]$WorkloadResult,
+        [array]$SessionResults,
         [array]$FSLogixEvents,
         [hashtable]$TestParams
     )
@@ -273,6 +283,13 @@ function New-HtmlReport {
     $cpuText = if ($null -ne $AvgCpu) { "$AvgCpu% avg / $MaxCpu% max" } else { 'No CPU samples collected' }
     $loginText = if ($Identity.LoginTime) { $Identity.LoginTime.ToString('yyyy-MM-dd HH:mm:ss') } else { 'Unknown (explorer.exe not found for this session)' }
     $logoffText = if ($TestParams.LogoffAtEnd) { $TestParams.EndTime } else { 'Not requested (-LogoffAtEnd not passed) - session left open' }
+    $totalIterations = ($SessionResults | Measure-Object -Property Iterations -Sum).Sum
+    $totalAppFailures = ($SessionResults | ForEach-Object { $_.WordFail + $_.ExcelFail + $_.TeamsFail + $_.ChromeFail } | Measure-Object -Sum).Sum
+
+    $sessionRows = ($SessionResults | ForEach-Object {
+        "<tr><td>Session $($_.SessionId)</td><td>$($_.Iterations)</td><td>$($_.WordFail)</td><td>$($_.ExcelFail)</td><td>$($_.TeamsFail)</td><td>$($_.ChromeFail)</td></tr>"
+    }) -join "`n"
+    if (-not $sessionRows) { $sessionRows = '<tr><td colspan="6" class="muted">No session data reported</td></tr>' }
 
     $fslogixRows = ($FSLogixEvents | ForEach-Object {
         "<tr><td>$(Enc($_.TimeCreated.ToString('HH:mm:ss')))</td><td>$($_.Id)</td><td>$(Enc($_.LevelDisplayName))</td><td>$(Enc($_.Message))</td></tr>"
@@ -333,8 +350,9 @@ function New-HtmlReport {
 
     <div class="cards">
       <div class="card"><div class="label">CPU (avg / max)</div><div class="value">$cpuText</div></div>
-      <div class="card"><div class="label">Iterations</div><div class="value">$($WorkloadResult.Iterations)</div></div>
-      <div class="card"><div class="label">App failures</div><div class="value">$($WorkloadResult.WordFail + $WorkloadResult.ExcelFail + $WorkloadResult.TeamsFail + $WorkloadResult.ChromeFail)</div></div>
+      <div class="card"><div class="label">Sessions</div><div class="value">$($SessionResults.Count)</div></div>
+      <div class="card"><div class="label">Iterations</div><div class="value">$totalIterations</div></div>
+      <div class="card"><div class="label">App failures</div><div class="value">$totalAppFailures</div></div>
     </div>
 
     <div class="panel">
@@ -351,16 +369,17 @@ function New-HtmlReport {
       <h2>Test parameters</h2>
       <div class="params">
         <span><b>Duration</b> $($TestParams.DurationMinutes) min</span>
+        <span><b>Sessions</b> $($TestParams.Sessions)</span>
         <span><b>CPU threshold</b> $($TestParams.CpuThresholdPercent)%</span>
         <span><b>Report</b> $(Enc($TestParams.ReportPath))</span>
       </div>
     </div>
 
     <div class="panel">
-      <h2>Workload results</h2>
+      <h2>Results by session</h2>
       <table>
-        <thead><tr><th>Iterations</th><th>Word fails</th><th>Excel fails</th><th>Teams fails</th><th>Chrome fails</th></tr></thead>
-        <tbody><tr><td>$($WorkloadResult.Iterations)</td><td>$($WorkloadResult.WordFail)</td><td>$($WorkloadResult.ExcelFail)</td><td>$($WorkloadResult.TeamsFail)</td><td>$($WorkloadResult.ChromeFail)</td></tr></tbody>
+        <thead><tr><th>Session</th><th>Iterations</th><th>Word fails</th><th>Excel fails</th><th>Teams fails</th><th>Chrome fails</th></tr></thead>
+        <tbody>$sessionRows</tbody>
       </table>
     </div>
 
@@ -382,7 +401,7 @@ function New-HtmlReport {
 # ============================================================
 # MAIN
 # ============================================================
-Write-Step "Starting stress test - $env:COMPUTERNAME / $env:USERNAME / session $sessionId / pid $PID ($DurationMinutes min)"
+Write-Step "Starting stress test - $env:COMPUTERNAME / $env:USERNAME / session $sessionId ($Sessions simulated sessions, $DurationMinutes min)"
 
 $loginTime = Get-SessionLoginTime -SessionId $sessionId
 if ($loginTime) {
@@ -395,7 +414,11 @@ $startTime = Get-Date
 $deadline = $startTime.AddMinutes($DurationMinutes)
 
 $cpuJob = Start-CpuSampler -Deadline $deadline
-$workloadResult = Invoke-Workload -Deadline $deadline
+$workloadJobs = 1..$Sessions | ForEach-Object { Start-Job -ScriptBlock $workload -ArgumentList $deadline, $_ }
+
+$workloadJobs | Wait-Job | Out-Null
+$sessionResults = @($workloadJobs | Receive-Job)
+$workloadJobs | Remove-Job
 
 $cpuJob | Wait-Job | Out-Null
 $cpuSamples = @($cpuJob | Receive-Job)
@@ -409,7 +432,9 @@ $pass = if ($null -ne $avgCpu) { $avgCpu -le $CpuThresholdPercent } else { $null
 $fslogixEvents = Get-FSLogixEventsSince -Since $(if ($loginTime) { $loginTime } else { $startTime })
 
 Write-Step 'Results'
-Write-Host "  $($workloadResult.Iterations) iterations, Word fails: $($workloadResult.WordFail), Excel fails: $($workloadResult.ExcelFail), Teams fails: $($workloadResult.TeamsFail), Chrome fails: $($workloadResult.ChromeFail)"
+$sessionResults | ForEach-Object {
+    Write-Host "  Session $($_.SessionId): $($_.Iterations) iterations, Word fails: $($_.WordFail), Excel fails: $($_.ExcelFail), Teams fails: $($_.TeamsFail), Chrome fails: $($_.ChromeFail)"
+}
 if ($null -eq $pass) {
     Write-Host "  CPU: UNKNOWN - no samples collected" -ForegroundColor Yellow
 } elseif ($pass) {
@@ -428,6 +453,7 @@ $identity = @{
 
 $testParams = @{
     DurationMinutes     = $DurationMinutes
+    Sessions            = $Sessions
     CpuThresholdPercent = $CpuThresholdPercent
     StartTime           = $startTime.ToString('yyyy-MM-dd HH:mm:ss')
     EndTime             = $endTime.ToString('yyyy-MM-dd HH:mm:ss')
@@ -436,7 +462,7 @@ $testParams = @{
 }
 
 $html = New-HtmlReport -Identity $identity -AvgCpu $avgCpu -MaxCpu $maxCpu -Pass $pass `
-    -WorkloadResult $workloadResult -FSLogixEvents $fslogixEvents -TestParams $testParams
+    -SessionResults $sessionResults -FSLogixEvents $fslogixEvents -TestParams $testParams
 Set-Content -Path $ReportPath -Value $html -Encoding UTF8
 Write-Step "Report written to $ReportPath"
 

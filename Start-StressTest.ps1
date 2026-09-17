@@ -21,10 +21,17 @@
          supporting diagnostic data (not asserting specific event ID meanings - just surfaced
          raw for you to read).
       3. Runs -Sessions parallel workload streams for -DurationMinutes each: CPU burn, disk
-         I/O, Word/Excel COM automation (Microsoft 365 Apps for enterprise), a Teams process
-         launch/stop, and a headless Chrome launch representing the Genesys Cloud agent
-         desktop's browser + background-assistant footprint. Genesys Cloud itself is NOT
-         logged into - see the Chrome step's own comment for why.
+         I/O, and a headless Chrome launch representing the Genesys Cloud agent desktop's
+         browser + background-assistant footprint. Genesys Cloud itself is NOT logged into -
+         see the Chrome step's own comment for why.
+
+         Word/Excel/Teams COM/process automation was tried here and removed: in production
+         it hung on a modal dialog nothing could dismiss (scheduled task runs hidden, no user
+         present to click through it), which blocked the whole run forever - the report never
+         got written because Wait-Job never returned - and whatever partial document DID get
+         created fell back to SaveAs's default location (the user's Documents folder) since
+         the SaveAs call itself was what hung. Chrome's headless mode doesn't have this
+         problem (no dialogs, and the job has a hard timeout below regardless).
       4. Samples local CPU for the whole window via Get-Counter and evaluates it against
          -CpuThresholdPercent.
       5. Writes an HTML report (uniquely named per run, so a scheduled task firing on every
@@ -64,8 +71,7 @@
 
 .NOTES
     No Az PowerShell module required. Run as the same user context real sessions run as (not
-    an elevated admin RDP session) if you want the Office/Teams/Chrome results to be
-    representative.
+    an elevated admin RDP session) if you want the Chrome result to be representative.
 #>
 
 [CmdletBinding()]
@@ -135,9 +141,14 @@ function Get-FSLogixEventsSince {
 }
 
 # ------------------------------------------------------------
-# Workload for one simulated session - CPU burn + disk I/O + Word/Excel/
-# Teams/Chrome. Run as a scriptblock via Start-Job, one job per -Sessions,
-# so all simulated sessions run concurrently within this one logon.
+# Workload for one simulated session - CPU burn + disk I/O + headless
+# Chrome. Run as a scriptblock via Start-Job, one job per -Sessions, so all
+# simulated sessions run concurrently within this one logon.
+#
+# Word/Excel/Teams were removed from here - see .DESCRIPTION for why
+# (unbounded COM/process calls that hung on an undismissable dialog under
+# the hidden scheduled task, which blocked the whole run and stopped the
+# report from ever being written).
 # ------------------------------------------------------------
 $workload = {
     param($Deadline, $SessionId)
@@ -150,14 +161,7 @@ $workload = {
         (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe')
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
-    # New Teams (per-user install) and classic Teams (machine-wide) live in different places -
-    # check both since we don't know which one this image ended up with.
-    $teamsPath = @(
-        (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\ms-teams.exe')
-        (Join-Path $env:LOCALAPPDATA 'Microsoft\Teams\current\Teams.exe')
-    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-    $counts = [ordered]@{ Iterations = 0; WordFail = 0; ExcelFail = 0; TeamsFail = 0; ChromeFail = 0 }
+    $counts = [ordered]@{ Iterations = 0; ChromeFail = 0 }
 
     while ((Get-Date) -lt $Deadline) {
         $counts.Iterations++
@@ -172,50 +176,6 @@ $workload = {
         [System.IO.File]::WriteAllBytes($filePath, (New-Object byte[] (5MB)))
         [void][System.IO.File]::ReadAllBytes($filePath)
         Remove-Item $filePath -ErrorAction SilentlyContinue
-
-        # Word
-        $word = $null
-        try {
-            $word = New-Object -ComObject Word.Application
-            $word.Visible = $false
-            $doc = $word.Documents.Add()
-            $doc.Content.Text = ("Stress test session $SessionId iteration $($counts.Iterations). " * 50)
-            $docPath = Join-Path $tempDir "doc_$($counts.Iterations).docx"
-            $doc.SaveAs([ref]$docPath)
-            $doc.Close()
-            Remove-Item $docPath -ErrorAction SilentlyContinue
-        } catch {
-            $counts.WordFail++
-        } finally {
-            if ($word) { $word.Quit(); [System.Runtime.Interopservices.Marshal]::ReleaseComObject($word) | Out-Null }
-        }
-
-        # Excel
-        $excel = $null
-        try {
-            $excel = New-Object -ComObject Excel.Application
-            $excel.Visible = $false
-            $wb = $excel.Workbooks.Add()
-            $wb.Sheets.Item(1).Cells.Item(1, 1) = "Stress test session $SessionId iteration $($counts.Iterations)"
-            $xlsxPath = Join-Path $tempDir "wb_$($counts.Iterations).xlsx"
-            $wb.SaveAs($xlsxPath)
-            $wb.Close($false)
-            Remove-Item $xlsxPath -ErrorAction SilentlyContinue
-        } catch {
-            $counts.ExcelFail++
-        } finally {
-            if ($excel) { $excel.Quit(); [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null }
-        }
-
-        # Teams
-        try {
-            if (-not $teamsPath) { throw "Teams executable not found" }
-            $proc = Start-Process -FilePath $teamsPath -PassThru -ErrorAction Stop
-            Start-Sleep -Seconds 5
-            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-        } catch {
-            $counts.TeamsFail++
-        }
 
         # Chrome - representative Genesys Cloud agent-desktop footprint (no login/credentials -
         # Genesys Cloud is a SaaS platform reached via browser + its Background Assistant
@@ -237,9 +197,6 @@ $workload = {
     [PSCustomObject]@{
         SessionId  = $SessionId
         Iterations = $counts.Iterations
-        WordFail   = $counts.WordFail
-        ExcelFail  = $counts.ExcelFail
-        TeamsFail  = $counts.TeamsFail
         ChromeFail = $counts.ChromeFail
     }
 }
@@ -284,12 +241,12 @@ function New-HtmlReport {
     $loginText = if ($Identity.LoginTime) { $Identity.LoginTime.ToString('yyyy-MM-dd HH:mm:ss') } else { 'Unknown (explorer.exe not found for this session)' }
     $logoffText = if ($TestParams.LogoffAtEnd) { $TestParams.EndTime } else { 'Not requested (-LogoffAtEnd not passed) - session left open' }
     $totalIterations = ($SessionResults | Measure-Object -Property Iterations -Sum).Sum
-    $totalAppFailures = ($SessionResults | ForEach-Object { $_.WordFail + $_.ExcelFail + $_.TeamsFail + $_.ChromeFail } | Measure-Object -Sum).Sum
+    $totalAppFailures = ($SessionResults | Measure-Object -Property ChromeFail -Sum).Sum
 
     $sessionRows = ($SessionResults | ForEach-Object {
-        "<tr><td>Session $($_.SessionId)</td><td>$($_.Iterations)</td><td>$($_.WordFail)</td><td>$($_.ExcelFail)</td><td>$($_.TeamsFail)</td><td>$($_.ChromeFail)</td></tr>"
+        "<tr><td>Session $($_.SessionId)</td><td>$($_.Iterations)</td><td>$($_.ChromeFail)</td></tr>"
     }) -join "`n"
-    if (-not $sessionRows) { $sessionRows = '<tr><td colspan="6" class="muted">No session data reported</td></tr>' }
+    if (-not $sessionRows) { $sessionRows = '<tr><td colspan="3" class="muted">No session data reported</td></tr>' }
 
     $fslogixRows = ($FSLogixEvents | ForEach-Object {
         "<tr><td>$(Enc($_.TimeCreated.ToString('HH:mm:ss')))</td><td>$($_.Id)</td><td>$(Enc($_.LevelDisplayName))</td><td>$(Enc($_.Message))</td></tr>"
@@ -378,7 +335,7 @@ function New-HtmlReport {
     <div class="panel">
       <h2>Results by session</h2>
       <table>
-        <thead><tr><th>Session</th><th>Iterations</th><th>Word fails</th><th>Excel fails</th><th>Teams fails</th><th>Chrome fails</th></tr></thead>
+        <thead><tr><th>Session</th><th>Iterations</th><th>Chrome fails</th></tr></thead>
         <tbody>$sessionRows</tbody>
       </table>
     </div>
@@ -416,13 +373,24 @@ $deadline = $startTime.AddMinutes($DurationMinutes)
 $cpuJob = Start-CpuSampler -Deadline $deadline
 $workloadJobs = 1..$Sessions | ForEach-Object { Start-Job -ScriptBlock $workload -ArgumentList $deadline, $_ }
 
-$workloadJobs | Wait-Job | Out-Null
+# Hard timeout, not an unbounded wait: the workload loop should finish at $deadline on its
+# own, but if anything inside it ever hangs again (as Word/Excel COM did in production - see
+# .DESCRIPTION), this guarantees the run still terminates and the report still gets written
+# instead of hanging forever.
+$jobTimeoutSeconds = ($DurationMinutes * 60) + 120
+$workloadJobs | Wait-Job -Timeout $jobTimeoutSeconds | Out-Null
+$stillRunning = $workloadJobs | Where-Object { $_.State -eq 'Running' }
+if ($stillRunning) {
+    Write-Host "$($stillRunning.Count) session job(s) exceeded the timeout - stopping them" -ForegroundColor Yellow
+    $stillRunning | Stop-Job
+}
 $sessionResults = @($workloadJobs | Receive-Job)
-$workloadJobs | Remove-Job
+$workloadJobs | Remove-Job -Force
 
-$cpuJob | Wait-Job | Out-Null
+$cpuJob | Wait-Job -Timeout $jobTimeoutSeconds | Out-Null
+if ($cpuJob.State -eq 'Running') { $cpuJob | Stop-Job }
 $cpuSamples = @($cpuJob | Receive-Job)
-$cpuJob | Remove-Job
+$cpuJob | Remove-Job -Force
 $endTime = Get-Date
 
 $avgCpu = if ($cpuSamples.Count -gt 0) { [math]::Round(($cpuSamples | Measure-Object -Average).Average, 1) } else { $null }
@@ -433,7 +401,7 @@ $fslogixEvents = Get-FSLogixEventsSince -Since $(if ($loginTime) { $loginTime } 
 
 Write-Step 'Results'
 $sessionResults | ForEach-Object {
-    Write-Host "  Session $($_.SessionId): $($_.Iterations) iterations, Word fails: $($_.WordFail), Excel fails: $($_.ExcelFail), Teams fails: $($_.TeamsFail), Chrome fails: $($_.ChromeFail)"
+    Write-Host "  Session $($_.SessionId): $($_.Iterations) iterations, Chrome fails: $($_.ChromeFail)"
 }
 if ($null -eq $pass) {
     Write-Host "  CPU: UNKNOWN - no samples collected" -ForegroundColor Yellow
